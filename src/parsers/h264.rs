@@ -1,15 +1,15 @@
 
 
 
-use h264_reader::Context;
 
+#[cfg(feature = "moq")]
 use hang::{BroadcastProducer, catalog::H264};
+
 #[cfg(feature = "moq")]
 use moq_lite::Track;
 
-use std::sync::{Arc, Mutex};
 
-#[allow(dead_code)]
+#[cfg(feature = "moq")]
 pub struct AnnexBStreamImport {
     broadcast: Arc<Mutex<BroadcastProducer>>,
     codec: Option<H264>,
@@ -18,6 +18,7 @@ pub struct AnnexBStreamImport {
     height: u32,
 }
 
+#[cfg(feature = "moq")]
 impl AnnexBStreamImport {
     pub fn new(broadcast: Arc<Mutex<BroadcastProducer>>, width: u32, height: u32) -> Self {
         Self {
