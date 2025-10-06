@@ -11,6 +11,7 @@ readme = "README.md"
 [features]
 opencv = ["dep:opencv"]
 v4l = ["dep:v4l"]
+moq = ["dep:moq-native", "dep:moq-lite", "dep:web-transport-quinn"]
 
 [dependencies]
 anyhow = "1.0.93"
@@ -19,15 +20,15 @@ ffmpeg-next = "7.1.0"
 futures = "0.3.31"
 h264-reader = "0.8.0"
 hang = "0.4.0"
-moq-native = "0.7.1"
-moq-lite = "0.3.3"
+moq-native = { version = "0.7.1", optional = true }
+moq-lite = { version = "0.3.3", optional = true }
 opencv = { version = "0.93.4", optional = true }
 serde = { version = "1.0.215", features = ["derive"] }
 thiserror = "2.0.3"
 tokio = { version = "1.41.1", features = ["full"] }
 tokio-stream = { version = "0.1.16", features = ["full"] }
 tracing = "0.1.40"
-web-transport-quinn = "0.7.2"
+web-transport-quinn = { version = "0.7.2", optional = true }
 
 # only available on linux
 [target.'cfg(target_os = "linux")'.dependencies]

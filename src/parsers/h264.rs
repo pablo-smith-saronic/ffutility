@@ -1,22 +1,15 @@
-use anyhow::{Result, bail};
 
-use bytes::BytesMut;
 
-use futures::StreamExt;
-use futures::stream::Stream;
 
 use h264_reader::Context;
-use h264_reader::annexb::AnnexBReader;
-use h264_reader::nal::{pps::PicParameterSet, slice::{SliceFamily, SliceHeader}, sps::SeqParameterSet, Nal, RefNal, UnitType};
-use h264_reader::push::NalInterest;
 
-use hang::{BroadcastProducer, catalog::{H264, Video, VideoConfig}, Frame, Timestamp, TrackProducer};
+use hang::{BroadcastProducer, catalog::H264};
+#[cfg(feature = "moq")]
 use moq_lite::Track;
 
-use std::cell::Cell;
-use std::io::Read;
-use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, mpsc::channel};
+use std::sync::{Arc, Mutex};
 
+#[allow(dead_code)]
 pub struct AnnexBStreamImport {
     broadcast: Arc<Mutex<BroadcastProducer>>,
     codec: Option<H264>,
@@ -36,6 +29,7 @@ impl AnnexBStreamImport {
         }
     }
 
+    #[cfg(feature = "moq")]
     pub async fn init_from<T: Stream<Item = BytesMut> + Unpin>(&mut self, input: &mut T) -> Result<TrackProducer> {
         let mut ctx = Context::new();
         let mut sps: Option<SeqParameterSet> = None;
@@ -116,6 +110,7 @@ impl AnnexBStreamImport {
 
     }
 
+    #[cfg(feature = "moq")]
     pub async fn read_from<T: Stream<Item = BytesMut> + Unpin>(&mut self, input: &mut T, track: &mut TrackProducer) -> Result<()> {
         if self.ctx.is_none() || self.codec.is_none() {
             bail!("AnnexBImport not initialized");
