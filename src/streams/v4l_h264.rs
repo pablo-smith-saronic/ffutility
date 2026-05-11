@@ -149,6 +149,16 @@ impl V4lH264Stream {
 
             let format = v4l_dev.format().unwrap();
             debug!("V4L Format: {:?}", format);
+
+            // Track the geometry the mmap ring was allocated for. When the
+            // upstream writer renegotiates the V4L2 format mid-stream (e.g.
+            // a process swap from torchyd2 to gtd, with different output
+            // dimensions), v4l_dev.format() begins reporting the new dims
+            // but the existing MmapStream's buffers are still sized for the
+            // old ones — frames land partially-filled, rows misaligned, the
+            // tail black. Detect that and rebuild the stream below.
+            let mut active_width = format.width;
+            let mut active_height = format.height;
             // TODO: Make this EncoderConfig settable by the user
             let ec = EncoderConfig {
                 input_width: format.width,
@@ -176,13 +186,43 @@ impl V4lH264Stream {
             let mut encoder = VideoEncoder::new(ec, &live_ffmpeg_opts).unwrap();
 
             loop {
+                // Detect geometry renegotiation by the upstream writer.
+                // If the format changed since we allocated the mmap ring,
+                // drop the stream and reallocate so kernel buffers match
+                // the new frame size. Done before .next() so the very next
+                // dequeue sees correctly-sized buffers.
+                let live_format = v4l_dev.format().unwrap();
+                if live_format.width != active_width
+                    || live_format.height != active_height
+                {
+                    debug!(
+                        "V4L format changed: {}x{} -> {}x{}; reallocating mmap ring",
+                        active_width, active_height, live_format.width, live_format.height
+                    );
+                    // Drop the old stream first — it borrows v4l_dev.
+                    drop(stream);
+                    stream = MmapStream::new(&v4l_dev, Type::VideoCapture).unwrap();
+                    active_width = live_format.width;
+                    active_height = live_format.height;
+                }
+
                 // TODO: Better error handling
                 match stream.next() {
                     Ok((m_buf, meta)) => {
                         let bytesused = meta.bytesused as usize;
                         // debug!("V4L bytesused: {}", meta.bytesused);
-                        if let Some(encoded_frame) =
-                            encoder.encode_raw(Some(pts), &m_buf[..bytesused]).unwrap()
+                        // encode_raw_sized rebuilds the scaler when the dims
+                        // change and returns a typed error rather than
+                        // panicking inside copy_from_slice. Dims come from
+                        // the format we just re-queried above.
+                        if let Some(encoded_frame) = encoder
+                            .encode_raw_sized(
+                                Some(pts),
+                                &m_buf[..bytesused],
+                                active_width,
+                                active_height,
+                            )
+                            .unwrap()
                         {
                             tx.blocking_send(Ok(encoded_frame.data)).unwrap();
                         }

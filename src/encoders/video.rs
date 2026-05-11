@@ -98,6 +98,14 @@ pub enum VideoEncoderError {
         prev_pts: i64,
         curr_pts: i64
     },
+    #[error("input slice length {actual} does not match expected {expected} bytes for {width}x{height} {input_type:?}")]
+    InputSizeMismatch {
+        actual: usize,
+        expected: usize,
+        width: u32,
+        height: u32,
+        input_type: AvPixel,
+    },
     #[error("ffmpeg error: ")]
     FfmpegError(#[from] AvError),
     #[error("failed to alloc avcodec context")]
@@ -209,14 +217,64 @@ impl VideoEncoder {
         self.encode(pts, out_frame)
     }
 
+    /// Encode a raw byte slice at the dimensions configured when the
+    /// [`VideoEncoder`] was constructed. Convenience wrapper around
+    /// [`Self::encode_raw_sized`]; prefer the sized variant when the source
+    /// geometry can vary at runtime (e.g. a V4L2 loopback whose writer was
+    /// swapped without re-initializing the reader).
     pub fn encode_raw(&mut self, pts: Option<i64>, input: &[u8]) -> Result<Option<EncodedFrame>, VideoEncoderError> {
-        debug!("input len: {}", input.len());
-        
+        let w = self.input_width;
+        let h = self.input_height;
+        self.encode_raw_sized(pts, input, w, h)
+    }
+
+    /// Encode a raw byte slice whose dimensions may differ from the
+    /// `input_width`/`input_height` the encoder was constructed with.
+    /// Rebuilds the input frame and the scaler whenever `(width, height)`
+    /// changes, so it's safe to drive from a source that renegotiates
+    /// geometry on the fly.
+    ///
+    /// Output dimensions stay locked to whatever was configured in
+    /// [`EncoderConfig`], so the encoded stream remains consistent across
+    /// input-size flips.
+    ///
+    /// Returns [`VideoEncoderError::InputSizeMismatch`] when `input.len()`
+    /// does not match the bytes implied by `width`, `height`, and the
+    /// configured `input_type`.
+    pub fn encode_raw_sized(
+        &mut self,
+        pts: Option<i64>,
+        input: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<Option<EncodedFrame>, VideoEncoderError> {
+        debug!("input len: {} ({}x{})", input.len(), width, height);
+
         if input.is_empty() {
             debug!("Received empty frame, skipping encoding");
             return Ok(None);
         }
-        
+
+        // Rebuild scaler when input geometry changes from the previous call.
+        // Allocation is light; this only fires on writer swaps in practice.
+        if width != self.input_width || height != self.input_height {
+            debug!(
+                "input geometry changed: {}x{} -> {}x{}; rebuilding scaler",
+                self.input_width, self.input_height, width, height
+            );
+            self.scaler = AvScalingContext::get(
+                self.input_type,
+                width,
+                height,
+                AvPixel::YUV420P,
+                self.output_width,
+                self.output_height,
+                Flags::BILINEAR,
+            )?;
+            self.input_width = width;
+            self.input_height = height;
+        }
+
         let mut out_frame = AvFrame::new(
             AvPixel::YUV420P,
             self.output_width.try_into().unwrap(),
@@ -225,9 +283,22 @@ impl VideoEncoder {
 
         let mut in_frame = AvFrame::new(
             self.input_type,
-            self.input_width.try_into().unwrap(),
-            self.input_height.try_into().unwrap(),
+            width.try_into().unwrap(),
+            height.try_into().unwrap(),
         );
+
+        // Validate the slice length matches the frame buffer before copying.
+        // Raises a typed error instead of panicking inside copy_from_slice.
+        let expected: usize = (0..in_frame.planes()).map(|i| in_frame.data(i).len()).sum();
+        if input.len() != expected {
+            return Err(VideoEncoderError::InputSizeMismatch {
+                actual: input.len(),
+                expected,
+                width,
+                height,
+                input_type: self.input_type,
+            });
+        }
 
         if in_frame.planes() > 1 {
             let mut start_id = 0;
@@ -237,7 +308,6 @@ impl VideoEncoder {
                 in_frame.data_mut(i).copy_from_slice(&input[start_id..end_id]);
                 start_id = end_id;
             }
-            // in_frame.data_mut(0).copy_from_slice(input);
         } else {
             in_frame.data_mut(0).copy_from_slice(input);
         }

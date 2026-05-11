@@ -1,3 +1,7 @@
 /target
 
 .direnv/
+
+# nix dev artifacts injected by pre-commit / direnv
+/.pre-commit-config.yaml
+/Cargo.nix
