@@ -135,11 +135,6 @@ unsafe impl Sync for VideoEncoder {}
 
 impl VideoEncoder {
     pub fn new(ec: EncoderConfig) -> Result<Self, VideoEncoderError> {
-        // "framerate" is a ffutility-level pseudo-option (frames/sec): it sets
-        // the encoder frame rate + time base rather than being forwarded to
-        // the codec. A valid time base is mandatory — libx264 aborts
-        // avcodec_open2 with EINVAL ("The encoder timebase is not set") without
-        // one. Defaults to 30 when unset.
         let mut fps: i32 = 30;
         let mut opts = AvDictionary::new();
         for (k, v) in &ec.opts {
