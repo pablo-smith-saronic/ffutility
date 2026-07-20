@@ -120,34 +120,74 @@ impl V4lH264Stream {
                 nal_frames
             });
 
-            let mut v4l_dev = Device::with_path(&cfg.video_dev)
-                .expect("Failed to open v4l device. Device may not exist.");
-            loop {
-                // block until the v4l_device is up
-                if cfg.v4l_fourcc == v4l_dev.format().unwrap().fourcc {
-                    break;
-                } else {
-                    tracing::error!(
-                        "{} doesn't have requested FourCC {}!",
-                        &cfg.video_dev.as_str(),
-                        cfg.v4l_fourcc
-                    );
-                    if let Some(frames) = cached_loading_frames.as_ref() {
-                        if !send_loading_frames(&tx, frames) {
-                            return;
-                        }
-                    } else {
-                        std::thread::sleep(std::time::Duration::from_secs(1));
+            // Open the capture device and wait until the upstream writer has
+            // negotiated the requested FourCC. Every failure path retries with
+            // the loading image instead of panicking: consumers build with
+            // `panic = "abort"`, so a panic here aborts the whole process, and
+            // with a systemd `Restart=on-failure` unit that turns a transient
+            // condition into an unrecoverable crash loop (CRSW-402).
+            let (mut v4l_dev, format) = 'open: loop {
+                match Device::with_path(&cfg.video_dev) {
+                    Ok(dev) => match dev.format() {
+                        Ok(fmt) if fmt.fourcc == cfg.v4l_fourcc => break 'open (dev, fmt),
+                        Ok(fmt) => tracing::error!(
+                            "{} advertises FourCC {} but {} was requested (writer not ready?)",
+                            &cfg.video_dev.as_str(),
+                            fmt.fourcc,
+                            cfg.v4l_fourcc
+                        ),
+                        Err(e) => tracing::error!(
+                            "Failed to read format on {}: {e}",
+                            &cfg.video_dev.as_str()
+                        ),
+                    },
+                    Err(e) => {
+                        tracing::error!("Failed to open {}: {e}", &cfg.video_dev.as_str())
                     }
-
-                    v4l_dev = Device::with_path(&cfg.video_dev)
-                        .expect("Failed to open v4l device. Device may not exist.");
                 }
-            }
+                if let Some(frames) = cached_loading_frames.as_ref() {
+                    if !send_loading_frames(&tx, frames) {
+                        return;
+                    }
+                } else {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            };
 
-            let mut stream = MmapStream::new(&v4l_dev, Type::VideoCapture).unwrap();
+            // Allocate the mmap capture ring. VIDIOC_REQBUFS returns EBUSY when
+            // another consumer still holds the (shared) v4l2loopback buffer
+            // pool. Retry with the loading image and a fresh fd rather than
+            // panicking, so the reader self-heals once the pool frees up
+            // instead of crash-looping the process (CRSW-402).
+            let mut stream = 'reqbufs: loop {
+                match MmapStream::new(&v4l_dev, Type::VideoCapture) {
+                    Ok(s) => break 'reqbufs s,
+                    Err(e) => {
+                        tracing::error!(
+                            "VIDIOC_REQBUFS on {} failed ({e}); another consumer may still \
+                             hold the buffer pool. Retrying…",
+                            &cfg.video_dev.as_str()
+                        );
+                        if let Some(frames) = cached_loading_frames.as_ref() {
+                            if !send_loading_frames(&tx, frames) {
+                                return;
+                            }
+                        } else {
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                        }
+                        // Reopen so the kernel-side fd state is fresh before the
+                        // next REQBUFS attempt.
+                        match Device::with_path(&cfg.video_dev) {
+                            Ok(dev) => v4l_dev = dev,
+                            Err(e) => tracing::error!(
+                                "Failed to reopen {}: {e}",
+                                &cfg.video_dev.as_str()
+                            ),
+                        }
+                    }
+                }
+            };
 
-            let format = v4l_dev.format().unwrap();
             debug!("V4L Format: {:?}", format);
 
             // Track the geometry the mmap ring was allocated for. When the
@@ -185,36 +225,75 @@ impl V4lH264Stream {
             let mut pts: i64 = 0;
             let mut encoder = VideoEncoder::new(ec, &live_ffmpeg_opts).unwrap();
 
-            loop {
-                // Detect geometry renegotiation by the upstream writer.
-                // If the format changed since we allocated the mmap ring,
-                // drop the stream and reallocate so kernel buffers match
-                // the new frame size. Done before .next() so the very next
-                // dequeue sees correctly-sized buffers.
-                let live_format = v4l_dev.format().unwrap();
-                if live_format.width != active_width
-                    || live_format.height != active_height
-                {
-                    debug!(
-                        "V4L format changed: {}x{} -> {}x{}; reallocating mmap ring",
-                        active_width, active_height, live_format.width, live_format.height
-                    );
-                    // Drop the old stream first — it borrows v4l_dev.
-                    drop(stream);
-                    stream = MmapStream::new(&v4l_dev, Type::VideoCapture).unwrap();
-                    active_width = live_format.width;
-                    active_height = live_format.height;
-                }
+            // Bytes-per-pixel for the configured input. BGR3/RGB3 are 3;
+            // single-plane Mono formats would be 1. v4l2loopback frames are
+            // always single-plane packed so this is correct as a divisor.
+            let bpp: usize = match input_type {
+                AvPixel::BGR24 | AvPixel::RGB24 => 3,
+                AvPixel::GRAY8 => 1,
+                AvPixel::RGBA | AvPixel::BGRA | AvPixel::ARGB | AvPixel::ABGR => 4,
+                _ => 3,
+            };
 
+            loop {
                 // TODO: Better error handling
                 match stream.next() {
                     Ok((m_buf, meta)) => {
                         let bytesused = meta.bytesused as usize;
                         // debug!("V4L bytesused: {}", meta.bytesused);
+
+                        // Detect geometry renegotiation by the upstream
+                        // writer. v4l_dev.format() is unreliable as a signal
+                        // here — v4l2loopback caches the format the *first*
+                        // writer set and reports that forever, even after a
+                        // later writer renegotiates. The actual frame size
+                        // is bytesused; trust that over the format query.
+                        //
+                        // When the bytes-per-frame doesn't match the dims
+                        // we're currently driving the encoder with, the
+                        // writer changed. Reopen the device (forces a fresh
+                        // kernel-side format read) and rebuild the mmap
+                        // ring at the new geometry. Drop this frame — the
+                        // next dequeue lands on a correctly-sized buffer.
+                        let expected_bytes = active_width as usize * active_height as usize * bpp;
+                        if bytesused != expected_bytes && bytesused > 0 {
+                            // Derive new dims. Width is the most reliable
+                            // single value to read from format() since rows
+                            // are stride-packed; total bytes / (width * bpp)
+                            // gives height regardless of whether the format
+                            // query lied about height.
+                            let probe_format = v4l_dev.format().unwrap();
+                            let new_width = probe_format.width;
+                            let derived_height = if new_width > 0 {
+                                (bytesused / (new_width as usize * bpp)) as u32
+                            } else {
+                                0
+                            };
+
+                            debug!(
+                                "V4L frame size changed: {}x{} ({} bytes) -> {}x{} ({} bytes); \
+                                 reopening device and rebuilding mmap ring",
+                                active_width, active_height, expected_bytes,
+                                new_width, derived_height, bytesused
+                            );
+
+                            drop(stream);
+                            // Reopen so the kernel-side state for this fd
+                            // is fresh — v4l2loopback ties cached format to
+                            // the open fd.
+                            v4l_dev = Device::with_path(&cfg.video_dev)
+                                .expect("Failed to reopen v4l device");
+                            stream = MmapStream::new(&v4l_dev, Type::VideoCapture).unwrap();
+                            active_width = new_width;
+                            active_height = derived_height;
+                            // Skip this stale frame; the next iteration
+                            // pulls a fresh one at the new geometry.
+                            continue;
+                        }
+
                         // encode_raw_sized rebuilds the scaler when the dims
                         // change and returns a typed error rather than
-                        // panicking inside copy_from_slice. Dims come from
-                        // the format we just re-queried above.
+                        // panicking inside copy_from_slice.
                         if let Some(encoded_frame) = encoder
                             .encode_raw_sized(
                                 Some(pts),
