@@ -5,6 +5,7 @@ use ffmpeg::codec::packet::Packet as AvPacket;
 use ffmpeg::software::scaling::{context::Context as AvScalingContext, flag::Flags};
 use ffmpeg::util::format::Pixel as AvPixel;
 use ffmpeg::util::frame::Video as AvFrame;
+use ffmpeg::util::rational::Rational;
 use ffmpeg::Dictionary as AvDictionary;
 use ffmpeg::Error as AvError;
 use ffmpeg_next as ffmpeg;
@@ -134,8 +135,22 @@ unsafe impl Sync for VideoEncoder {}
 
 impl VideoEncoder {
     pub fn new(ec: EncoderConfig) -> Result<Self, VideoEncoderError> {
+        // "framerate" is a ffutility-level pseudo-option (frames/sec): it sets
+        // the encoder frame rate + time base rather than being forwarded to
+        // the codec. A valid time base is mandatory — libx264 aborts
+        // avcodec_open2 with EINVAL ("The encoder timebase is not set") without
+        // one. Defaults to 30 when unset.
+        let mut fps: i32 = 30;
         let mut opts = AvDictionary::new();
         for (k, v) in &ec.opts {
+            if k == "framerate" {
+                if let Ok(parsed) = v.parse::<i32>() {
+                    if parsed > 0 {
+                        fps = parsed;
+                    }
+                }
+                continue;
+            }
             opts.set(k, v);
         }
 
@@ -145,6 +160,8 @@ impl VideoEncoder {
         ffmpeg_vid_encoder.set_width(ec.output_width);
         ffmpeg_vid_encoder.set_height(ec.output_height);
         ffmpeg_vid_encoder.set_format(AvPixel::YUV420P);
+        ffmpeg_vid_encoder.set_frame_rate(Some(Rational(fps, 1)));
+        ffmpeg_vid_encoder.set_time_base(Rational(1, fps));
         let encoder = ffmpeg_vid_encoder.open_with(opts)?;
 
         let scaler = AvScalingContext::get(
